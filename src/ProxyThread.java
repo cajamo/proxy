@@ -11,10 +11,11 @@ import java.util.TimeZone;
 public class ProxyThread extends Thread
 {
     private Socket socket;
-    private static final int BUFFER_SIZE = Short.MAX_VALUE;
+    private static final int BUFFER_SIZE = 2 << 24;
     //Since each thread is a unique HTTP connection, we have instance variables.
     private HttpURLConnection urlConnection;
     private String urlName;
+    private boolean shouldCache = false;
 
     public ProxyThread(Socket socket)
     {
@@ -63,8 +64,39 @@ public class ProxyThread extends Thread
 
     private void cache(HttpURLConnection huc, byte[] websiteContent)
     {
+        boolean revalidate = false;
+        long maxAge = 0;
+
         String etag = huc.getHeaderField("ETag");
-        CachedSite cachedSite = new CachedSite(websiteContent, Instant.now(), etag);
+        String cacheControl = huc.getHeaderField("Cache-Control");
+
+        if (cacheControl != null)
+        {
+            String[] cacheControlArr = cacheControl.split(", ");
+
+            for (String option : cacheControlArr)
+            {
+                if (option.contains("max-age"))
+                {
+                    maxAge = Long.valueOf(option.substring(8));
+                }
+                switch (option)
+                {
+                    // This breaks out of cache method, and does not cache anything.
+                    case "no-store":
+                    case "private":
+                        return;
+                    case "public":
+                        break;
+                    case "must-revalidate":
+                    case "proxy-revalidate":
+                        revalidate = true;
+                    default:
+                        break;
+                }
+            }
+        }
+        CachedSite cachedSite = new CachedSite(websiteContent, Instant.now(), etag, revalidate, maxAge);
         ProxyServer.getSiteMap().put(urlName, cachedSite);
     }
 
@@ -76,8 +108,7 @@ public class ProxyThread extends Thread
      */
     private InputStream extractConnectionData(HttpURLConnection huc) throws IOException
     {
-        URL url = huc.getURL();
-
+        // If it gets to this point and is cached, we must revalidate.
         if (isCached(urlName))
         {
             CachedSite cachedSite = ProxyServer.getSiteMap().get(urlName);
@@ -95,17 +126,13 @@ public class ProxyThread extends Thread
         switch (huc.getResponseCode())
         {
             case HttpURLConnection.HTTP_OK:
-                //Remove it to re-cache if HTTP has been modified.
-                ProxyServer.getSiteMap().remove(urlName);
                 inputStream = huc.getInputStream();
                 break;
-            //Sometimes Java cannot follow the 301/302 errors, so we manually handle those cases.
             case HttpURLConnection.HTTP_MOVED_PERM:
-            case HttpURLConnection.HTTP_MOVED_TEMP:
+                shouldCache = true;
                 URL redirURL = new URL(huc.getHeaderField("Location"));
                 this.urlConnection = (HttpURLConnection) redirURL.openConnection();
                 return extractConnectionData(urlConnection);
-            //Some webpages do not support this protocol, e.g. google/yahoo/bing
             case HttpURLConnection.HTTP_NOT_MODIFIED:
                 inputStream = new ByteArrayInputStream(ProxyServer.getSiteMap().get(urlName).getContent());
                 break;
@@ -135,14 +162,19 @@ public class ProxyThread extends Thread
                 urlName = inputLine.split(" ")[1];
             }
 
+            // If is cached, and is fresh, just directly write the cached version to the user.
+            if (isCached(urlName) && ProxyServer.getSiteMap().get(urlName).isFresh())
+            {
+                out.write(getStreamOutput(new ByteArrayInputStream(ProxyServer.getSiteMap().get(urlName).getContent())));
+                out.close();
+                in.close();
+                return;
+            }
+
             urlConnection = (HttpURLConnection) new URL(urlName).openConnection();
             byte[] webpageData = getStreamOutput(extractConnectionData(urlConnection));
 
-
-            if (!isCached(urlName))
-            {
-                cache(urlConnection, webpageData);
-            }
+            cache(urlConnection, webpageData);
 
             //Write to output (e.g. back to client)
             out.write(webpageData);
@@ -152,7 +184,6 @@ public class ProxyThread extends Thread
             {
                 socket.close();
             }
-
         } catch (IOException e)
         {
             e.printStackTrace();
