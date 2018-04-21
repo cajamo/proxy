@@ -2,7 +2,9 @@ import java.io.*;
 import java.net.HttpURLConnection;
 import java.net.Socket;
 import java.net.URL;
+import java.text.ParseException;
 import java.text.SimpleDateFormat;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.Date;
 import java.util.Locale;
@@ -10,12 +12,15 @@ import java.util.TimeZone;
 
 public class ProxyThread extends Thread
 {
-    private Socket socket;
     private static final int BUFFER_SIZE = 2 << 24;
+    private static final int DEFAULT_CACHE_TIME = 86400;
+
+    private SimpleDateFormat httpTime = new SimpleDateFormat("EEE, dd MMM yyyy HH:mm:ss z", Locale.US);
+
+    private Socket socket;
     //Since each thread is a unique HTTP connection, we have instance variables.
     private HttpURLConnection urlConnection;
     private String urlName;
-    private boolean shouldCache = false;
 
     public ProxyThread(Socket socket)
     {
@@ -32,9 +37,20 @@ public class ProxyThread extends Thread
      */
     private String toHttpTimeFormat(Instant instant)
     {
-        SimpleDateFormat sdf = new SimpleDateFormat("EEE, dd MMM yyyy HH:mm:ss z", Locale.US);
-        sdf.setTimeZone(TimeZone.getTimeZone("GMT"));
-        return sdf.format(new Date(instant.toEpochMilli()));
+        httpTime.setTimeZone(TimeZone.getTimeZone("GMT"));
+        return httpTime.format(new Date(instant.toEpochMilli()));
+    }
+
+    private Instant fromHttpTimeFormat(String date)
+    {
+        try
+        {
+            return httpTime.parse(date).toInstant();
+        } catch (ParseException e)
+        {
+            e.printStackTrace();
+        }
+        return null;
     }
 
     /**
@@ -62,12 +78,38 @@ public class ProxyThread extends Thread
         return buffer.toByteArray();
     }
 
-    private void cache(HttpURLConnection huc, byte[] websiteContent)
+    /**
+     * According to RFC2616
+     * A response received with a status code of 200, 203, 206, 300, 301 or 410 MAY
+     * be stored by a cache and used in reply to a subsequent request,
+     * subject to the expiration mechanism, unless a cache-control directive
+     * prohibits caching.
+     *
+     * @param urlResponseCode The Response code
+     * @return Whether the URL is cacheable
+     */
+    private boolean returnCodeOk(int urlResponseCode)
+    {
+        switch (urlResponseCode)
+        {
+            case HttpURLConnection.HTTP_OK:
+            case HttpURLConnection.HTTP_NOT_AUTHORITATIVE:
+            case HttpURLConnection.HTTP_PARTIAL:
+            case HttpURLConnection.HTTP_MULT_CHOICE:
+            case HttpURLConnection.HTTP_MOVED_PERM:
+            case HttpURLConnection.HTTP_GONE:
+                return true;
+            default:
+                return true;
+        }
+    }
+
+    private void conditionalCache(HttpURLConnection huc, byte[] websiteContent)
     {
         boolean revalidate = false;
-        long maxAge = 0;
+        long maxAge = -1;
 
-        String etag = huc.getHeaderField("ETag");
+        System.out.println(huc.getHeaderFields());
         String cacheControl = huc.getHeaderField("Cache-Control");
 
         if (cacheControl != null)
@@ -78,26 +120,67 @@ public class ProxyThread extends Thread
             {
                 if (option.contains("max-age"))
                 {
+                    // the max-age substring is 7 characters long
                     maxAge = Long.valueOf(option.substring(8));
                 }
+
                 switch (option)
                 {
-                    // This breaks out of cache method, and does not cache anything.
+                    // This breaks out of conditionalCache method, and does not conditionalCache anything.
                     case "no-store":
                     case "private":
                         return;
-                    case "public":
-                        break;
                     case "must-revalidate":
                     case "proxy-revalidate":
                         revalidate = true;
+                    case "public":
                     default:
                         break;
                 }
             }
         }
+
+        if (maxAge == -1)
+        {
+            maxAge = findExpireTime(huc.getHeaderField("Date"), huc.getHeaderField("Expires"),
+                    huc.getHeaderField("Last-Modified"));
+        }
+
+        String etag = huc.getHeaderField("ETag");
+
+        System.out.println(maxAge);
         CachedSite cachedSite = new CachedSite(websiteContent, Instant.now(), etag, revalidate, maxAge);
         ProxyServer.getSiteMap().put(urlName, cachedSite);
+    }
+
+    /**
+     * Finds length of time before conditionalCache of website goes stale
+     *
+     * @param date         The HTTP Header "Date"
+     * @param expires      The HTTP Header "Expires"
+     * @param lastModified The HTTP Header "Last-Modified"
+     * @return Number of seconds until expiration.
+     */
+    private int findExpireTime(String date, String expires, String lastModified)
+    {
+        Instant dateInstant, expiresInstant, lastModInstant = null;
+
+        dateInstant = date == null ? Instant.now() : fromHttpTimeFormat(date);
+        expiresInstant = expires == null ? null : fromHttpTimeFormat(expires);
+        lastModInstant = lastModified == null ? null : fromHttpTimeFormat(lastModified);
+
+        if (expiresInstant != null && dateInstant != null)
+        {
+            return (int) Duration.between(dateInstant, expiresInstant).getSeconds();
+        }
+        else if (expiresInstant == null && dateInstant != null && lastModInstant != null)
+        {
+            return (int) Duration.between(lastModInstant, dateInstant).getSeconds() / 10;
+        }
+        else
+        {
+            return DEFAULT_CACHE_TIME;
+        }
     }
 
     /**
@@ -106,7 +189,7 @@ public class ProxyThread extends Thread
      * @param huc HTTP Connection that user wants to extract data from
      * @return Returns InputStream of the webpage content.
      */
-    private InputStream extractConnectionData(HttpURLConnection huc) throws IOException
+    private InputStream getWebpageContent(HttpURLConnection huc) throws IOException
     {
         // If it gets to this point and is cached, we must revalidate.
         if (isCached(urlName))
@@ -122,26 +205,30 @@ public class ProxyThread extends Thread
             }
         }
 
-        InputStream inputStream = null;
+        InputStream inputStream;
         switch (huc.getResponseCode())
         {
             case HttpURLConnection.HTTP_OK:
                 inputStream = huc.getInputStream();
                 break;
             case HttpURLConnection.HTTP_MOVED_PERM:
-                shouldCache = true;
+                //Manually redirect to new webpage
                 URL redirURL = new URL(huc.getHeaderField("Location"));
                 this.urlConnection = (HttpURLConnection) redirURL.openConnection();
-                return extractConnectionData(urlConnection);
+                return getWebpageContent(urlConnection);
             case HttpURLConnection.HTTP_NOT_MODIFIED:
                 inputStream = new ByteArrayInputStream(ProxyServer.getSiteMap().get(urlName).getContent());
                 break;
-            //"The client SHOULD NOT repeat the request without modifications" according to RFC 2616
-            //Therefore we do not cache HTTP_BAD_REQUEST responses.
             case HttpURLConnection.HTTP_BAD_REQUEST:
-                //The server does not support the functionality to fulfill the request
             case HttpURLConnection.HTTP_NOT_IMPLEMENTED:
-                inputStream = huc.getErrorStream();
+            default:
+                try
+                {
+                    inputStream = huc.getInputStream();
+                } catch (IOException e)
+                {
+                    inputStream = huc.getErrorStream();
+                }
                 break;
         }
         return inputStream;
@@ -165,16 +252,22 @@ public class ProxyThread extends Thread
             // If is cached, and is fresh, just directly write the cached version to the user.
             if (isCached(urlName) && ProxyServer.getSiteMap().get(urlName).isFresh())
             {
+                System.out.println("here");
                 out.write(getStreamOutput(new ByteArrayInputStream(ProxyServer.getSiteMap().get(urlName).getContent())));
                 out.close();
                 in.close();
                 return;
             }
 
+            // Else it opens a connection to the url
             urlConnection = (HttpURLConnection) new URL(urlName).openConnection();
-            byte[] webpageData = getStreamOutput(extractConnectionData(urlConnection));
+            byte[] webpageData = getStreamOutput(getWebpageContent(urlConnection));
 
-            cache(urlConnection, webpageData);
+            // Check response is even cacheable
+            if (returnCodeOk(urlConnection.getResponseCode()))
+            {
+                conditionalCache(urlConnection, webpageData);
+            }
 
             //Write to output (e.g. back to client)
             out.write(webpageData);

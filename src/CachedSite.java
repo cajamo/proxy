@@ -22,7 +22,8 @@ public class CachedSite
 
     public boolean isFresh()
     {
-        return !mustRevalidate && cachedTime.plus(maxAge, ChronoUnit.SECONDS).isAfter(Instant.now());
+        // Never fresh if must revalidate, or if maxAge was never set.
+        return !mustRevalidate && (cachedTime.plus(maxAge, ChronoUnit.SECONDS).isAfter(Instant.now()) || maxAge == -1);
     }
 
     public String getEtag()
