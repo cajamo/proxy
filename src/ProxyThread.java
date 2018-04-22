@@ -94,13 +94,12 @@ public class ProxyThread extends Thread
         {
             case HttpURLConnection.HTTP_OK:
             case HttpURLConnection.HTTP_NOT_AUTHORITATIVE:
-            case HttpURLConnection.HTTP_PARTIAL:
             case HttpURLConnection.HTTP_MULT_CHOICE:
             case HttpURLConnection.HTTP_MOVED_PERM:
             case HttpURLConnection.HTTP_GONE:
                 return true;
             default:
-                return true;
+                return false;
         }
     }
 
@@ -109,7 +108,6 @@ public class ProxyThread extends Thread
         boolean revalidate = false;
         long maxAge = -1;
 
-        System.out.println(huc.getHeaderFields());
         String cacheControl = huc.getHeaderField("Cache-Control");
 
         if (cacheControl != null)
@@ -135,7 +133,7 @@ public class ProxyThread extends Thread
                         revalidate = true;
                     case "public":
                     default:
-                        break;
+                        continue;
                 }
             }
         }
@@ -148,7 +146,6 @@ public class ProxyThread extends Thread
 
         String etag = huc.getHeaderField("ETag");
 
-        System.out.println(maxAge);
         CachedSite cachedSite = new CachedSite(websiteContent, Instant.now(), etag, revalidate, maxAge);
         ProxyServer.getSiteMap().put(urlName, cachedSite);
     }
@@ -252,7 +249,6 @@ public class ProxyThread extends Thread
             // If is cached, and is fresh, just directly write the cached version to the user.
             if (isCached(urlName) && ProxyServer.getSiteMap().get(urlName).isFresh())
             {
-                System.out.println("here");
                 out.write(getStreamOutput(new ByteArrayInputStream(ProxyServer.getSiteMap().get(urlName).getContent())));
                 out.close();
                 in.close();
