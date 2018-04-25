@@ -97,6 +97,7 @@ public class ProxyThread extends Thread
             case HttpURLConnection.HTTP_MULT_CHOICE:
             case HttpURLConnection.HTTP_MOVED_PERM:
             case HttpURLConnection.HTTP_GONE:
+            case HttpURLConnection.HTTP_NOT_MODIFIED:
                 return true;
             default:
                 return false;
@@ -126,6 +127,7 @@ public class ProxyThread extends Thread
                 {
                     // This breaks out of conditionalCache method, and does not conditionalCache anything.
                     case "no-store":
+                    case "no-cache":
                     case "private":
                         return;
                     case "must-revalidate":
@@ -263,6 +265,14 @@ public class ProxyThread extends Thread
             if (returnCodeOk(urlConnection.getResponseCode()))
             {
                 conditionalCache(urlConnection, webpageData);
+            }
+            else if (urlConnection.getResponseCode() > 399)
+            {
+                String output = "HTTP/1.1 " + urlConnection.getResponseCode() + urlConnection.getResponseMessage();
+                out.write(output.getBytes());
+                out.close();
+                in.close();
+                return;
             }
 
             //Write to output (e.g. back to client)
